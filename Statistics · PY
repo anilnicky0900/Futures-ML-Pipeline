@@ -1,0 +1,172 @@
+"""
+MODULE 4 — STATISTICS & VISUALISATION
+=======================================
+LLM Prompt used to generate this module:
+  "Create a statistics module for a binary trading classifier. Compute:
+   1. Overall directional accuracy (% correct sign predictions)
+   2. Precision for + predictions (long calls) and - predictions (short calls)
+      separately — i.e. of all times we said 'go long', how many were right?
+   3. Accuracy above a confidence threshold (only count trades where model
+      confidence >= threshold)
+   4. AUM equity curve: start with $10,000, go long (+1) or short (-1) each
+      minute based on prediction, apply % price change to capital
+   5. ROC curve and AUC score
+   Plot everything on a clean black-on-white 2x2 matplotlib figure.
+   Save figure to disk and return all metrics as a dict."
+
+INPUT : y_true, y_pred, y_proba, y_continuous, threshold, starting_capital
+OUTPUT: metrics (dict), aum_history (ndarray), fpr, tpr, roc_auc
+"""
+
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
+from sklearn.metrics import (roc_curve, auc, confusion_matrix)
+
+
+def compute_metrics(y_true, y_pred, y_proba, y_continuous,
+                    threshold=0.55, starting_capital=10_000.0):
+
+    # Overall accuracy
+    overall_acc = float(np.mean(y_true == y_pred) * 100)
+
+    # Per-class precision
+    cm    = confusion_matrix(y_true, y_pred, labels=[1, -1])
+    tp_p  = cm[0, 0]; fp_p = cm[1, 0]
+    tp_n  = cm[1, 1]; fp_n = cm[0, 1]
+    prec_pos = tp_p / (tp_p + fp_p) * 100 if (tp_p + fp_p) > 0 else 0.0
+    prec_neg = tp_n / (tp_n + fp_n) * 100 if (tp_n + fp_n) > 0 else 0.0
+
+    # Threshold accuracy (only count when confidence is high enough)
+    conf       = np.abs(y_proba - 0.5) + 0.5
+    high_conf  = conf >= threshold
+    n_traded   = int(high_conf.sum())
+    acc_thresh = (float(np.mean(y_true[high_conf] == y_pred[high_conf]) * 100)
+                  if n_traded > 0 else 0.0)
+
+    # AUM equity curve
+    capital     = starting_capital
+    aum_history = [capital]
+    for i in range(len(y_pred)):
+        pos     = int(y_pred[i])           # +1 long, -1 short
+        capital += pos * capital * y_continuous[i] / 100
+        aum_history.append(capital)
+
+    # ROC
+    fpr, tpr, _ = roc_curve(y_true, y_proba, pos_label=1)
+    roc_auc     = float(auc(fpr, tpr))
+
+    metrics = {
+        "overall_accuracy":    round(overall_acc, 2),
+        "precision_positive":  round(prec_pos, 2),
+        "precision_negative":  round(prec_neg, 2),
+        "accuracy_threshold":  round(acc_thresh, 2),
+        "n_traded":            n_traded,
+        "threshold_used":      threshold,
+        "roc_auc":             round(roc_auc, 4),
+        "final_capital":       round(aum_history[-1], 2),
+        "pnl":                 round(aum_history[-1] - starting_capital, 2),
+    }
+    return metrics, np.array(aum_history), fpr, tpr, roc_auc
+
+
+def plot_results(metrics, aum_history, fpr, tpr, roc_auc,
+                 out_path="results.png", title_suffix=""):
+
+    fig, axes = plt.subplots(2, 2, figsize=(13, 8))
+    fig.patch.set_facecolor("white")
+    fig.suptitle(f"Pipeline Results  —  {title_suffix}",
+                 fontsize=13, fontweight="bold", color="black")
+
+    for ax in axes.flat:
+        ax.set_facecolor("white")
+        for sp in ax.spines.values():
+            sp.set_color("#333")
+        ax.tick_params(colors="black", labelsize=9)
+        ax.xaxis.label.set_color("black")
+        ax.yaxis.label.set_color("black")
+
+    # ── AUM ──────────────────────────────────────────────────────
+    ax = axes[0, 0]
+    profit = metrics["pnl"] >= 0
+    ax.plot(aum_history, color="black", linewidth=1.5)
+    ax.axhline(aum_history[0], color="#777", linestyle="--", linewidth=0.8)
+    ax.fill_between(range(len(aum_history)), aum_history[0], aum_history,
+                    where=[v >= aum_history[0] for v in aum_history],
+                    alpha=0.12, color="black")
+    ax.set_title("AUM — Money Under Management", fontsize=11, color="black")
+    ax.set_xlabel("Time step"); ax.set_ylabel("Capital ($)")
+    ax.yaxis.set_major_formatter(
+        mticker.FuncFormatter(lambda x, _: f"${x:,.0f}"))
+    pnl_str = f"P&L: ${metrics['pnl']:+,.2f}"
+    ax.text(0.98, 0.05, pnl_str, transform=ax.transAxes,
+            ha="right", va="bottom", fontsize=10, color="black",
+            fontweight="bold")
+
+    # ── ROC ──────────────────────────────────────────────────────
+    ax = axes[0, 1]
+    ax.plot(fpr, tpr, color="black", linewidth=2,
+            label=f"AUC = {roc_auc:.3f}")
+    ax.fill_between(fpr, tpr, alpha=0.08, color="black")
+    ax.plot([0, 1], [0, 1], "--", color="#888", linewidth=0.8,
+            label="Random (0.500)")
+    ax.set_title("ROC Curve", fontsize=11, color="black")
+    ax.set_xlabel("False Positive Rate")
+    ax.set_ylabel("True Positive Rate")
+    ax.legend(frameon=False, fontsize=9)
+
+    # ── ACCURACY BARS ────────────────────────────────────────────
+    ax = axes[1, 0]
+    bar_labels = ["Overall", "+ Precision\n(Longs)",
+                  "- Precision\n(Shorts)",
+                  f"Conf ≥ {metrics['threshold_used']}"]
+    bar_vals   = [metrics["overall_accuracy"],
+                  metrics["precision_positive"],
+                  metrics["precision_negative"],
+                  metrics["accuracy_threshold"]]
+    shades = ["#111", "#333", "#555", "#777"]
+    bars   = ax.bar(bar_labels, bar_vals, color=shades,
+                    edgecolor="black", linewidth=0.7, width=0.5)
+    ax.axhline(50, color="red", linestyle="--", linewidth=1.0,
+               label="50% random baseline")
+    ax.set_ylim(0, 115)
+    ax.set_ylabel("Accuracy %")
+    ax.set_title("Prediction Accuracy Breakdown", fontsize=11, color="black")
+    ax.legend(frameon=False, fontsize=9)
+    for bar, val in zip(bars, bar_vals):
+        ax.text(bar.get_x() + bar.get_width() / 2,
+                bar.get_height() + 1.5,
+                f"{val:.1f}%", ha="center", va="bottom",
+                fontsize=9, color="black")
+
+    # ── SUMMARY TEXT ─────────────────────────────────────────────
+    ax = axes[1, 1]
+    ax.axis("off")
+    lines = [
+        "SUMMARY",
+        "",
+        f"Overall accuracy      {metrics['overall_accuracy']}%",
+        f"+ Precision (longs)   {metrics['precision_positive']}%",
+        f"- Precision (shorts)  {metrics['precision_negative']}%",
+        "",
+        f"Threshold ≥ {metrics['threshold_used']}",
+        f"  Accuracy            {metrics['accuracy_threshold']}%",
+        f"  Trades executed     {metrics['n_traded']}",
+        "",
+        f"ROC AUC               {metrics['roc_auc']}",
+        "",
+        f"Starting capital      $10,000",
+        f"Final capital         ${metrics['final_capital']:,.2f}",
+        f"P&L                   ${metrics['pnl']:+,.2f}",
+    ]
+    ax.text(0.05, 0.97, "\n".join(lines),
+            transform=ax.transAxes, va="top",
+            fontsize=10, fontfamily="monospace", color="black")
+
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches="tight",
+                facecolor="white", edgecolor="none")
+    plt.close()
+    return out_path
